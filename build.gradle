@@ -1,0 +1,205 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+    id 'jacoco'
+}
+
+group 'app.krista.extensions.EbPlayground.EbTesting'
+
+ext {
+    kristaApisVersion = '1.0.126'
+}
+
+def computedBaseName = "eb-doc-to-pdf-converter-extension"
+def computedVersion = "local"
+
+tasks.register("setReleaseProperties") {
+    dependsOn("generateReleaseProperties")
+    doFirst {
+        def releasePropsFile = file("release.properties")
+        if (releasePropsFile.exists()) {
+            def props = new Properties()
+            releasePropsFile.withInputStream { stream -> props.load(stream) }
+            computedBaseName = (props['extension.name'] ?: computedBaseName).replaceAll(/\s+/, "")
+            computedVersion = props['extension.version'] ?: computedVersion
+            project.ext.set("finalBaseName", computedBaseName)
+            project.version = computedVersion
+            println "Loaded extension name = ${computedBaseName}, version = ${computedVersion}"
+        } else {
+            logger.warn("release.properties not found; using default values.")
+            project.ext.set("finalBaseName", computedBaseName)
+            project.version = computedVersion
+        }
+    }
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+repositories {
+    mavenLocal()
+    maven { url "https://packages.cicd.in.antbrains.com/artifactory/libs-release" }
+    mavenCentral()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.compilerArgs << '-Xlint:all,-serial'
+}
+
+configurations {
+    implementation {
+        canBeConsumed = false
+        canBeResolved = true
+    }
+}
+
+dependencies {
+    // --- CORE (always) ---
+    annotationProcessor "app.krista:extension-impl-anno-processors:${kristaApisVersion}"
+    implementation "app.krista:krista-apis:${kristaApisVersion}"
+    implementation 'org.glassfish.hk2:hk2-api:3.0.3'
+
+    // --- Document conversion (local, no external API) ---
+    implementation 'org.apache.poi:poi:5.2.5'
+    implementation 'org.apache.poi:poi-ooxml:5.2.5'
+    implementation 'org.apache.poi:poi-scratchpad:5.2.5'
+    implementation 'org.apache.pdfbox:pdfbox:2.0.31'
+
+    // --- Testing ---
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.1'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    testImplementation 'org.mockito:mockito-core:5.8.0'
+    testImplementation 'org.mockito:mockito-junit-jupiter:5.8.0'
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+            afterEvaluate {
+                artifactId = jar.archiveBaseName.get()
+                groupId = rootProject.group
+            }
+        }
+    }
+    repositories {
+        mavenLocal()
+        maven {
+            credentials {
+                username = project.findProperty('MAVEN_USERNAME')
+                password = project.findProperty('MAVEN_PASSWORD')
+            }
+            authentication { basic(BasicAuthentication) }
+            url project.findProperty('MAVEN_UPLOAD_URL') ?: mavenLocal().url
+        }
+    }
+}
+
+jacoco {
+    toolVersion = "0.8.12"
+}
+jacocoTestReport {
+    dependsOn test
+    reports {
+        xml.required = true
+        html.required = true
+        csv.required = false
+    }
+}
+
+// =====================================================================================================
+// CORE — generate release.properties from the @Extension and @Domain annotations.
+// =====================================================================================================
+import java.util.regex.Pattern
+
+tasks.register('generateReleaseProperties') {
+    group = 'build'
+    description = 'Generates release.properties from @Extension and @Domain annotations'
+    doLast {
+        def extensionFilePath = 'src/main/java/app/krista/extensions/ebplayground/ebtesting/ebdoctopdfconverter/EbDocToPdfConverterExtension.java'
+        def areaFilePath = 'src/main/java/app/krista/extensions/ebplayground/ebtesting/ebdoctopdfconverter/catalog/DocumentConversionArea.java'
+        def extensionFile = project.file(extensionFilePath)
+        def areaFile = project.file(areaFilePath)
+        if (!extensionFile.exists()) { throw new GradleException("Extension file not found: ${extensionFilePath}") }
+        if (!areaFile.exists()) { throw new GradleException("Area file not found: ${areaFilePath}") }
+
+        def properties = new Properties()
+        def keyValuePattern = Pattern.compile(/(\w+)\s*=\s*"([^"]+)"/)
+
+        extractAnnotationInfo(extensionFile, "@Extension", keyValuePattern) { key, value ->
+            if (key == "version") { properties.setProperty("extension.version", value) }
+            else if (key == "name") { properties.setProperty("extension.name", value) }
+        }
+        extractAnnotationInfo(areaFile, "@Domain", keyValuePattern) { key, value ->
+            if (key == "name") { properties.setProperty("domain.name", value) }
+            else if (key == "ecosystemName") { properties.setProperty("ecosystem.name", value) }
+        }
+
+        if (!properties.getProperty('extension.name')) { properties.setProperty("extension.name", "EB Doc To Pdf Converter") }
+        if (!properties.getProperty('extension.version')) { throw new GradleException("Could not find extension version in ${extensionFilePath}") }
+        if (!properties.getProperty('domain.name')) { properties.setProperty("domain.name", "EB Testing") }
+        if (!properties.getProperty('ecosystem.name')) { properties.setProperty("ecosystem.name", "EB Playground") }
+
+        def releasePropertiesFile = project.file('release.properties')
+        def content = properties.collect { key, value -> "${key}=${value}" }.join('\n')
+        releasePropertiesFile.text = content + '\n'
+        logger.lifecycle("Generated release.properties:\n${content}")
+    }
+}
+
+def extractAnnotationInfo(File file, String annotationName, Pattern keyValuePattern, Closure processProperty) {
+    StringBuilder annotationText = new StringBuilder()
+    boolean inAnnotation = false
+    file.eachLine { line ->
+        line = line.trim()
+        if (line.contains(annotationName)) { inAnnotation = true; annotationText.setLength(0); annotationText.append(line) }
+        else if (inAnnotation) { annotationText.append(line) }
+        if (inAnnotation && line.contains(")")) {
+            inAnnotation = false
+            def matcher = keyValuePattern.matcher(annotationText.toString())
+            while (matcher.find()) { processProperty.call(matcher.group(1), matcher.group(2)) }
+        }
+    }
+}
+
+// =====================================================================================================
+// CORE — bundle sources into the jar under META-INF/project (platform convention).
+// =====================================================================================================
+tasks.register('createSourceDir', Exec) {
+    dependsOn processResources
+    commandLine "mkdir", "-p", "$projectDir/build/classes/java/main/META-INF/project"
+}
+tasks.register('copyGradleFile', Exec) {
+    dependsOn createSourceDir
+    commandLine "cp", "$projectDir/build.gradle", "$projectDir/build/classes/java/main/META-INF/project/build.gradle"
+}
+tasks.register('includeSources', Exec) {
+    dependsOn copyGradleFile
+    commandLine "cp", "-r", "$projectDir/src", "$projectDir/build/classes/java/main/META-INF/project/src"
+}
+
+tasks.named("jar") {
+    dependsOn tasks.named("generateReleaseProperties")
+}
+
+jar {
+    dependsOn tasks.named("setReleaseProperties")
+    dependsOn includeSources
+    archiveBaseName = project.ext.has("finalBaseName") ? project.ext.finalBaseName : "eb-doc-to-pdf-converter-extension"
+    manifest {}
+    from { configurations.implementation.collect { it.isDirectory() ? it : zipTree(it) } }
+    exclude 'META-INF/*.RSA', 'META-INF/*.SF', 'META-INF/*.DSA'
+    duplicatesStrategy = "exclude"
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events "passed", "skipped", "failed"
+        exceptionFormat "full"
+    }
+    finalizedBy jacocoTestReport
+}
